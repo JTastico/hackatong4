@@ -1,0 +1,40 @@
+# Datasets - NO commitear archivos de video pesados
+inputs/*.mp4
+inputs/*.csv
+inputs/*.svo2
+outputs/*.mp4
+outputs/*.csv
+outputs/*.json
+outputs/*.html
+
+# Mantener las carpetas vacias en el repo
+!inputs/.gitkeep
+!outputs/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv
+.env
+*.egg-info/
+
+# Node
+node_modules/
+package-lock.json
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude / API keys (CRITICO)
+.env
+*.key
+ANTHROPIC_API_KEY
+.anthropic/

@@ -1,0 +1,8 @@
+# Editen segun necesiten. Estas son sugerencias comunes para CV + IMU.
+# Si usan otro stack (Node, Rust, etc), borren este archivo y agreguen el suyo.
+
+opencv-python>=4.8.0
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.11.0
+matplotlib>=3.7.0
