@@ -32,19 +32,31 @@ class ImuProcessor:
 
     def detect_swing_events(self, imu_path: Path) -> Dict[str, List[ImuSwingEvent]]:
         imu_data = self._load_imu(imu_path)
-        times = imu_data["time_seconds"]
-        yaw = imu_data["yaw"]
+        times = self._normalize_time_seconds(imu_data["time_seconds"])
+        yaw = np.asarray(imu_data["yaw"], dtype=float)
 
         if len(times) < 5:
             return {"swing_events": []}
 
-        peaks, peak_props = find_peaks(yaw, prominence=0.15, distance=8)
+        # Suavizado para eliminar vibraciones de alta frecuencia.
+        smoothed_yaw = self._smooth_signal(yaw, window_size=9)
+        sample_period = self._estimate_sample_period(times)
+        min_distance_seconds = 10.0
+        min_distance_samples = max(1, int(min_distance_seconds / sample_period))
+        dynamic_prominence = max(0.5, float(np.std(smoothed_yaw)) * 0.7)
+
+        peaks, peak_props = find_peaks(
+            smoothed_yaw,
+            prominence=dynamic_prominence,
+            distance=min_distance_samples,
+        )
         swings: List[ImuSwingEvent] = []
-        for i, peak_idx in enumerate(peaks):
+        for peak_idx in peaks:
             peak_time = float(times[peak_idx])
-            peak_value = float(yaw[peak_idx])
-            start_idx = max(0, peak_idx - 5)
-            end_idx = min(len(times) - 1, peak_idx + 5)
+            peak_value = float(smoothed_yaw[peak_idx])
+            half_window = max(1, int(2.0 / sample_period))
+            start_idx = max(0, peak_idx - half_window)
+            end_idx = min(len(times) - 1, peak_idx + half_window)
 
             swings.append(
                 ImuSwingEvent(
@@ -55,7 +67,13 @@ class ImuProcessor:
                 )
             )
 
-        return {"swing_events": swings, "peak_prominences": peak_props.get("prominences", []).tolist()}
+        return {
+            "swing_events": swings,
+            "peak_prominences": peak_props.get("prominences", []).tolist(),
+            "sample_period_seconds": sample_period,
+            "applied_prominence": dynamic_prominence,
+            "applied_distance_samples": min_distance_samples,
+        }
 
     def _load_imu(self, imu_path: Path) -> Dict[str, np.ndarray]:
         suffix = imu_path.suffix.lower()
@@ -146,3 +164,34 @@ class ImuProcessor:
             return {"time_seconds": times, "yaw": yaw}
 
         raise ValueError(f"No se pudo interpretar el archivo NPY de IMU: {imu_path}")
+
+    def _smooth_signal(self, signal: np.ndarray, window_size: int = 9) -> np.ndarray:
+        if window_size <= 1 or len(signal) < window_size:
+            return signal
+        kernel = np.ones(window_size, dtype=float) / float(window_size)
+        return np.convolve(signal, kernel, mode="same")
+
+    def _estimate_sample_period(self, times: np.ndarray) -> float:
+        if len(times) < 2:
+            return 0.1
+        deltas = np.diff(times)
+        deltas = deltas[np.isfinite(deltas)]
+        deltas = deltas[deltas > 0]
+        if len(deltas) == 0:
+            return 0.1
+        return float(np.median(deltas))
+
+    def _normalize_time_seconds(self, raw_times: np.ndarray) -> np.ndarray:
+        times = np.asarray(raw_times, dtype=float)
+        if len(times) == 0:
+            return times
+
+        # Corrige telemetrías en epoch (ms/us/ns) y las lleva a segundos relativos.
+        if float(np.nanmax(times)) > 1e12:
+            times = times / 1e9  # ns -> s
+        elif float(np.nanmax(times)) > 1e9:
+            times = times / 1e3  # ms -> s
+
+        start = float(times[0])
+        times = times - start
+        return times

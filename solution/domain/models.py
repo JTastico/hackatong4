@@ -31,6 +31,8 @@ class Cycle(BaseModel):
     phase_times: PhaseTimes = Field(default_factory=PhaseTimes)
     estimated_fill_factor: float = Field(default=0.0, ge=0.0, le=1.2)
     truck_id: Optional[str] = None
+    # Heurística: lado del circuito / posición de descarga (reemplazar con visión estéreo real).
+    loading_lane: Optional[Literal["izquierda", "derecha", "desconocido"]] = "desconocido"
 
 
 class CyclesSummary(BaseModel):
@@ -67,5 +69,10 @@ class AnalysisReport(BaseModel):
 
     def output_filename(self) -> str:
         left_name = Path(self.video_info.left_video_path).stem
+        right_name = (
+            Path(self.video_info.right_video_path).stem
+            if self.video_info.right_video_path
+            else "mono"
+        )
         timestamp = self.video_info.analyzed_at.strftime("%Y%m%dT%H%M%S")
-        return f"{left_name}_productivity_report_{timestamp}.json"
+        return f"{left_name}_{right_name}_productivity_report_{timestamp}.json"
