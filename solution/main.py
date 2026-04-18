@@ -16,13 +16,12 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Generator
 
 import cv2
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 import uvicorn
 
@@ -159,7 +158,7 @@ class CycleDetector:
         imu_idx = min(int(frame_idx * ratio), len(self.gyro_z) - 1)
         return float(self.gyro_z[imu_idx])
 
-    _total_frames: int = 1  # set by VideoProcessor
+    _total_frames: int = 1  # set when opening video / building timeline
 
     def update(self, frame_idx: int, wall_now: float) -> None:
         """Process one video frame tick; update state machine."""
@@ -275,10 +274,10 @@ class CycleDetector:
             self._enter_phase("EXCAVATING", now)
         s.cycle_start = now
 
-    def get_metrics(self) -> dict:
+    def get_metrics(self, now_override: float | None = None) -> dict:
         with self._lock:
             s = self.state
-            now = time.time()
+            now = time.time() if now_override is None else float(now_override)
             elapsed_session = now - s.session_start
             recent = list(s.cycle_times)[-10:]
             avg_cycle = float(np.mean(recent)) if recent else TARGET_CYCLE_S
@@ -326,9 +325,10 @@ class CycleDetector:
 class MiningState:
     def __init__(self):
         self.phase = "INITIALIZING"
-        self.phase_start = time.time()
-        self.cycle_start = time.time()
-        self.session_start = time.time()
+        # Time base is "video seconds from clip start" for playback; batch mode uses the same.
+        self.phase_start = 0.0
+        self.cycle_start = 0.0
+        self.session_start = 0.0
         self.cycle_count = 0
         self.passes_this_truck = 0
         self.tons_this_truck = 0.0
@@ -340,124 +340,80 @@ class MiningState:
         }
 
 
-# ─── Video Processor ─────────────────────────────────────────────────────────
+# ─── Metrics timeline (precomputed for scrubbable playback) ─────────────────
 
-class VideoProcessor:
-    """Reads video in a background thread; provides annotated JPEG frames."""
+TIMELINE_LOCK = threading.Lock()
+# List of {"t": float, "metrics": dict}; built from left camera video in a background thread.
+TIMELINE_POINTS: list[dict] = []
+TIMELINE_META: dict = {
+    "ready": False,
+    "building": False,
+    "fps": 30.0,
+    "duration_s": 0.0,
+    "error": None,
+}
 
-    JPEG_QUALITY = 75
 
-    def __init__(self, path: Path | None, label: str, detector: CycleDetector):
-        self.path = path
-        self.label = label
-        self.detector = detector
-        self._cap: cv2.VideoCapture | None = None
-        self._frame_bytes: bytes = b""
-        self._lock = threading.Lock()
-        self._running = False
-        self._thread: threading.Thread | None = None
-        self._frame_idx = 0
-        self.fps = 30.0
-        self.total_frames = 1
-
-    def start(self) -> None:
-        if self.path is None:
-            print(f"[Video/{self.label}] No file found — will show placeholder.")
-            return
-        self._cap = cv2.VideoCapture(str(self.path))
-        if not self._cap.isOpened():
-            print(f"[Video/{self.label}] Cannot open {self.path}")
-            return
-        self.fps = self._cap.get(cv2.CAP_PROP_FPS) or 30.0
-        self.total_frames = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-        self.detector._total_frames = self.total_frames
-        self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._running = False
-        if self._cap:
-            self._cap.release()
-
-    def _loop(self) -> None:
-        delay = 1.0 / self.fps
-        while self._running:
-            t0 = time.time()
-            ret, frame = self._cap.read()
-            if not ret:
-                self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                self._frame_idx = 0
-                continue
-
-            self._frame_idx += 1
-            # Only left camera drives the detector
-            if self.label == "LEFT":
-                self.detector.update(self._frame_idx, time.time())
-
-            annotated = self._annotate(frame)
-            ok, buf = cv2.imencode(".jpg", annotated,
-                                   [cv2.IMWRITE_JPEG_QUALITY, self.JPEG_QUALITY])
-            if ok:
-                with self._lock:
-                    self._frame_bytes = buf.tobytes()
-
-            elapsed = time.time() - t0
-            sleep = max(0.0, delay - elapsed)
-            time.sleep(sleep)
-
-    def _annotate(self, frame: np.ndarray) -> np.ndarray:
-        metrics = self.detector.get_metrics()
-        phase = metrics["phase"]
-        color_hex = PHASE_COLORS.get(phase, "#718096")
-        bgr = tuple(int(color_hex.lstrip("#")[i:i+2], 16) for i in (4, 2, 0))
-
-        h, w = frame.shape[:2]
-        overlay = frame.copy()
-
-        # Top bar
-        cv2.rectangle(overlay, (0, 0), (w, 45), (15, 17, 23), -1)
-        cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
-
-        # Phase badge
-        cv2.rectangle(frame, (0, 0), (w, 40), bgr, -1)
-        txt = f"  {phase}  |  Ciclo #{metrics['cycle_count']}  |  Pase {metrics['passes_this_truck']}/{metrics['passes_per_truck']}"
-        cv2.putText(frame, txt, (8, 27), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65, (255, 255, 255), 2, cv2.LINE_AA)
-
-        # Bottom bar
-        cv2.rectangle(frame, (0, h - 35), (w, h), (15, 17, 23), -1)
-        bottom_txt = (f"  {self.label} CAM  |  "
-                      f"{metrics['avg_cycle_s']}s/ciclo  |  "
-                      f"{metrics['production_tph']} t/h  |  "
-                      f"Camion #{metrics['trucks_completed'] + 1}")
-        cv2.putText(frame, bottom_txt, (8, h - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
-
-        # Truck fill progress bar
-        bar_w = int(w * metrics["truck_fill_pct"] / 100)
-        cv2.rectangle(frame, (0, h - 38), (bar_w, h - 35), bgr, -1)
-        return frame
-
-    def get_frame_bytes(self) -> bytes:
-        with self._lock:
-            return self._frame_bytes
-
-    def mjpeg_generator(self) -> Generator[bytes, None, None]:
-        """Yields multipart MJPEG chunks."""
-        placeholder = self._make_placeholder()
+def _build_timeline_worker() -> None:
+    """Decode left video once; replay detector; store ~20 samples/s for the UI."""
+    global TIMELINE_POINTS, TIMELINE_META
+    with TIMELINE_LOCK:
+        TIMELINE_META = {**TIMELINE_META, "building": True, "error": None}
+    if LEFT_VIDEO is None:
+        with TIMELINE_LOCK:
+            TIMELINE_META = {
+                "ready": False,
+                "building": False,
+                "fps": 30.0,
+                "duration_s": 0.0,
+                "error": "no_left_video",
+            }
+        print("[Timeline] No left video — dashboard metrics will stay idle.")
+        return
+    try:
+        cap = cv2.VideoCapture(str(LEFT_VIDEO))
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open {LEFT_VIDEO}")
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        det = CycleDetector(imu_data, video_fps=fps)
+        det._total_frames = max(1, total)
+        points: list[dict] = []
+        downsample = max(1, int(round(fps / 20.0)))
+        frame_idx = 0
         while True:
-            data = self.get_frame_bytes() or placeholder
-            yield (b"--frame\r\n"
-                   b"Content-Type: image/jpeg\r\n\r\n" + data + b"\r\n")
-            time.sleep(1.0 / 30)
-
-    def _make_placeholder(self) -> bytes:
-        img = np.zeros((360, 640, 3), dtype=np.uint8)
-        cv2.putText(img, f"No video: {self.label}", (180, 180),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (100, 100, 100), 2)
-        _, buf = cv2.imencode(".jpg", img)
-        return buf.tobytes()
+            ret, _ = cap.read()
+            if not ret:
+                break
+            frame_idx += 1
+            t = frame_idx / fps
+            det.update(frame_idx, t)
+            if frame_idx % downsample == 0 or frame_idx == max(1, total):
+                m = det.get_metrics(now_override=t)
+                points.append({"t": round(t, 4), "metrics": m})
+        cap.release()
+        duration_s = frame_idx / fps if frame_idx else 0.0
+        with TIMELINE_LOCK:
+            TIMELINE_POINTS = points
+            TIMELINE_META = {
+                "ready": True,
+                "building": False,
+                "fps": round(fps, 3),
+                "duration_s": round(duration_s, 3),
+                "frame_count": frame_idx,
+                "error": None,
+            }
+        print(f"[Timeline] Ready: {len(points)} samples, {duration_s:.1f}s span")
+    except Exception as exc:
+        with TIMELINE_LOCK:
+            TIMELINE_META = {
+                "ready": False,
+                "building": False,
+                "fps": 30.0,
+                "duration_s": 0.0,
+                "error": str(exc),
+            }
+        print(f"[Timeline] Failed: {exc}")
 
 
 # ─── App bootstrap ────────────────────────────────────────────────────────────
@@ -465,20 +421,15 @@ class VideoProcessor:
 imu_data = load_imu(IMU_FILE)
 detector = CycleDetector(imu_data)
 
-left_proc  = VideoProcessor(LEFT_VIDEO,  "LEFT",  detector)
-right_proc = VideoProcessor(RIGHT_VIDEO, "RIGHT", detector)
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    left_proc.start()
-    right_proc.start()
+    threading.Thread(target=_build_timeline_worker, daemon=True).start()
     print(f"[App] Left  video : {LEFT_VIDEO}")
     print(f"[App] Right video : {RIGHT_VIDEO}")
     print(f"[App] IMU file    : {IMU_FILE}")
     print(f"[App] Dashboard   : http://localhost:8000")
     yield
-    left_proc.stop()
-    right_proc.stop()
 
 
 app = FastAPI(title="Mining Shovel Dashboard — Grupo 04", lifespan=lifespan)
@@ -492,20 +443,26 @@ async def dashboard(request: Request):
     return templates.TemplateResponse(request=request, name="index.html")
 
 
-@app.get("/video/left")
-async def video_left():
-    return StreamingResponse(
-        left_proc.mjpeg_generator(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-    )
+@app.get("/media/left")
+async def media_left():
+    if LEFT_VIDEO is None or not LEFT_VIDEO.is_file():
+        raise HTTPException(status_code=404, detail="Left video not found")
+    return FileResponse(LEFT_VIDEO, media_type="video/mp4")
 
 
-@app.get("/video/right")
-async def video_right():
-    return StreamingResponse(
-        right_proc.mjpeg_generator(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-    )
+@app.get("/media/right")
+async def media_right():
+    if RIGHT_VIDEO is None or not RIGHT_VIDEO.is_file():
+        raise HTTPException(status_code=404, detail="Right video not found")
+    return FileResponse(RIGHT_VIDEO, media_type="video/mp4")
+
+
+@app.get("/api/timeline")
+async def api_timeline():
+    with TIMELINE_LOCK:
+        meta = dict(TIMELINE_META)
+        points = list(TIMELINE_POINTS)
+    return {"meta": meta, "points": points}
 
 
 @app.get("/api/metrics")
@@ -555,7 +512,6 @@ def run_batch() -> None:
     detector._total_frames = total
 
     print(f"[Batch] Processing {total} frames @ {fps:.1f} fps...")
-    start_wall = time.time()
     frame_idx = 0
     report_interval = int(fps * 30)   # status every 30 s of video
 
@@ -565,18 +521,19 @@ def run_batch() -> None:
             break
         frame_idx += 1
         video_time = frame_idx / fps
-        detector.update(frame_idx, start_wall + video_time)
+        detector.update(frame_idx, video_time)
 
         if frame_idx % report_interval == 0:
             pct = frame_idx / total * 100
-            m = detector.get_metrics()
+            m = detector.get_metrics(now_override=video_time)
             print(f"  {pct:.0f}%  |  {m['cycle_count']} ciclos  |  "
                   f"{m['trucks_completed']} camiones  |  {m['production_tph']} t/h")
 
     if cap_left:  cap_left.release()
     if cap_right: cap_right.release()
 
-    metrics = detector.get_metrics()
+    duration_s = frame_idx / fps if frame_idx else 0.0
+    metrics = detector.get_metrics(now_override=duration_s)
     _write_outputs(metrics, total, fps)
     print("[Batch] Done. Outputs written to ./outputs/")
 

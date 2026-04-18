@@ -73,7 +73,11 @@
       font-size: .78rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .07em;
       display: flex; justify-content: space-between; align-items: center;
     }
-    .video-panel img { width: 100%; display: block; min-height: 220px; object-fit: cover; }
+    .video-panel video {
+      width: 100%; display: block; min-height: 220px; max-height: 380px;
+      background: #000; object-fit: contain;
+    }
+    .video-hint { font-size: .68rem; color: var(--muted); padding: 6px 14px 10px; background: #12151e; }
 
     /* ── Right column ── */
     .right-col { display: flex; flex-direction: column; gap: 12px; }
@@ -198,16 +202,17 @@
     <div class="video-panel">
       <div class="video-header">
         <span>📷 Cámara Izquierda</span>
-        <span id="left-status" style="color:#48bb78;">● LIVE</span>
+        <span id="left-status" style="color:#63b3ed;">● Referencia métricas</span>
       </div>
-      <img id="left-feed" src="/video/left" alt="Left Camera" onerror="this.src='/video/left'" />
+      <video id="left-feed" src="/media/left" controls playsinline preload="metadata"></video>
+      <div class="video-hint">Las KPI y gráficos siguen el tiempo de este video (pausa, adelanta o retrocede libremente).</div>
     </div>
     <div class="video-panel">
       <div class="video-header">
         <span>📷 Cámara Derecha</span>
-        <span id="right-status" style="color:#48bb78;">● LIVE</span>
+        <span id="right-status" style="color:#718096;">● Igual tiempo que izquierda</span>
       </div>
-      <img id="right-feed" src="/video/right" alt="Right Camera" onerror="this.src='/video/right'" />
+      <video id="right-feed" src="/media/right" playsinline preload="metadata" muted></video>
     </div>
   </div>
 
@@ -375,31 +380,81 @@ function updateBreakdown(avgs) {
   });
 }
 
-// ── SSE listener ─────────────────────────────────────────────────────────────
-let lastMetrics = null;
+// ── Timeline + video sync ───────────────────────────────────────────────────
+let timelinePoints = [];
 const badge = document.getElementById("conn-badge");
+const leftVideo = document.getElementById("left-feed");
+const rightVideo = document.getElementById("right-feed");
 
-function connectSSE() {
-  const es = new EventSource("/metrics/stream");
+function metricsAtTime(t) {
+  const pts = timelinePoints;
+  if (!pts.length) return null;
+  let lo = 0, hi = pts.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (pts[mid].t <= t) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  const i = Math.max(0, hi);
+  return pts[i].metrics;
+}
 
-  es.onmessage = (e) => {
+function syncRightToLeft() {
+  const t = leftVideo.currentTime;
+  if (!Number.isFinite(rightVideo.duration) || rightVideo.duration <= 0) return;
+  const target = Math.min(Math.max(0, t), rightVideo.duration - 1e-3);
+  if (Math.abs(rightVideo.currentTime - target) > 0.25) {
+    rightVideo.currentTime = target;
+  }
+}
+
+let rafPending = false;
+function onPlaybackTick() {
+  if (rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(() => {
+    rafPending = false;
+    const t = leftVideo.currentTime;
+    syncRightToLeft();
+    const m = metricsAtTime(t);
+    if (m) renderMetrics(m);
+  });
+}
+
+async function loadTimelineLoop() {
+  badge.textContent = "● PREPARANDO ANÁLISIS…";
+  badge.className = "";
+  for (;;) {
     try {
-      const m = JSON.parse(e.data);
-      lastMetrics = m;
-      renderMetrics(m);
-    } catch (err) {}
-  };
-
-  es.onerror = () => {
-    badge.textContent = "● DESCONECTADO";
-    badge.className = "off";
-    setTimeout(connectSSE, 3000);
-  };
-
-  es.onopen = () => {
-    badge.textContent = "● CONECTADO";
-    badge.className = "";
-  };
+      const res = await fetch("/api/timeline");
+      const data = await res.json();
+      const meta = data.meta || {};
+      if (meta.error === "no_left_video") {
+        badge.textContent = "● SIN VIDEO IZQUIERDO";
+        badge.className = "off";
+        document.getElementById("phase-desc").textContent = "No hay video *_left.mp4 en inputs/.";
+        return;
+      }
+      if (meta.ready && Array.isArray(data.points)) {
+        timelinePoints = data.points;
+        badge.textContent = "● LISTO · Reproducción";
+        badge.className = "";
+        const m0 = metricsAtTime(0);
+        if (m0) renderMetrics(m0);
+        return;
+      }
+      if (meta.error) {
+        badge.textContent = "● ERROR LÍNEA DE TIEMPO";
+        badge.className = "off";
+        document.getElementById("phase-desc").textContent = meta.error;
+        return;
+      }
+    } catch (e) {
+      badge.textContent = "● RECONECTANDO…";
+      badge.className = "off";
+    }
+    await new Promise(r => setTimeout(r, 400));
+  }
 }
 
 function renderMetrics(m) {
@@ -445,18 +500,27 @@ function renderMetrics(m) {
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────────
-connectSSE();
+loadTimelineLoop();
 
-// Refresh images on stall (fallback)
-setInterval(() => {
-  ["left-feed", "right-feed"].forEach(id => {
-    const img = document.getElementById(id);
-    if (!img.complete || img.naturalHeight === 0) {
-      const src = img.src.split("?")[0];
-      img.src = src + "?t=" + Date.now();
-    }
-  });
-}, 5000);
+["timeupdate", "seeked", "play", "pause", "loadedmetadata"].forEach(ev => {
+  leftVideo.addEventListener(ev, onPlaybackTick);
+});
+
+leftVideo.addEventListener("play", () => {
+  rightVideo.play().catch(() => {});
+});
+leftVideo.addEventListener("pause", () => {
+  rightVideo.pause();
+});
+
+leftVideo.addEventListener("error", () => {
+  document.getElementById("left-status").textContent = "● Error carga";
+  document.getElementById("left-status").style.color = "#fc8181";
+});
+rightVideo.addEventListener("error", () => {
+  document.getElementById("right-status").textContent = "● No disponible";
+  document.getElementById("right-status").style.color = "#fc8181";
+});
 </script>
 </body>
 </html>
