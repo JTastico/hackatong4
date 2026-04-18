@@ -28,8 +28,10 @@ if ! python -c "import fastapi" 2>/dev/null; then
   pip install -r requirements.txt -q
 fi
 
+# ejecutar con 
+
 echo "[Run] Ejecutando análisis en modo batch..."
-python -m solution.main --batch
+python -m solution.main
 
 echo ""
 echo "Outputs generados:"

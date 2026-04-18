@@ -151,7 +151,15 @@
     <h1>⛏ Mining Shovel Dashboard &nbsp;·&nbsp; Hitachi EX-5600</h1>
     <div class="subtitle">Jebi Hackathon 2026 · Grupo 04 &nbsp;|&nbsp; Análisis en tiempo real</div>
   </div>
-  <div id="conn-badge">● CONECTADO</div>
+  <div style="display: flex; gap: 10px; align-items: center;">
+    <button id="btn-generate" class="btn btn-sm btn-outline-warning" style="font-size: 0.72rem; font-weight: 700; border-radius: 20px; padding: 4px 12px; letter-spacing: 0.05em;">
+      ⚙️ GENERAR SALIDAS
+    </button>
+    <a href="/report" target="_blank" class="btn btn-sm btn-outline-info" style="font-size: 0.72rem; font-weight: 700; border-radius: 20px; padding: 4px 12px; letter-spacing: 0.05em; text-decoration: none;">
+      📄 VER REPORTE
+    </a>
+    <div id="conn-badge">● CONECTADO</div>
+  </div>
 </header>
 
 <!-- ── KPI Row ─────────────────────────────────────────────────────────────── -->
@@ -520,6 +528,26 @@ leftVideo.addEventListener("error", () => {
 rightVideo.addEventListener("error", () => {
   document.getElementById("right-status").textContent = "● No disponible";
   document.getElementById("right-status").style.color = "#fc8181";
+});
+// ── Actions ──────────────────────────────────────────────────────────────────
+document.getElementById("btn-generate").addEventListener("click", async () => {
+  const btn = document.getElementById("btn-generate");
+  const original = btn.textContent;
+  if (!confirm("Se iniciará el procesamiento completo de los videos para generar 'outputs/analysis.json' y 'outputs/report.html'. ¿Continuar?")) return;
+  
+  btn.disabled = true;
+  btn.textContent = "⌛ INICIADO...";
+  
+  try {
+    const res = await fetch("/api/generate-output", { method: "POST" });
+    const data = await res.json();
+    alert(data.message);
+  } catch (e) {
+    alert("Error al iniciar procesamiento: " + e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
 });
 </script>
 </body>
